@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='django-twitter-relations-history',
-    version=__import__('vkontakte_groups_migration').__version__,
+    version=__import__('twitter_relations_history').__version__,
     description='Django implementation for storing twitter user relations history',
     long_description=open('README.md').read(),
     author='ramusus',

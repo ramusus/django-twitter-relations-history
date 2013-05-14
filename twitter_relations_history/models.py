@@ -10,6 +10,9 @@ import logging
 
 log = logging.getLogger('twitter_relations_history')
 
+class NoDeltaForFirstHistory(ValueError):
+    pass
+
 def ModelQuerySetManager(ManagerBase=models.Manager):
     '''
     Function that return Manager for using QuerySet class inside the model definition
@@ -55,24 +58,12 @@ class RelationsHistoryManager(models.Manager, RelationsHistoryQueryset):
         if created:
             stat.set_defaults()
 
-        offset = offset or stat.offset
+        stat.time = datetime.now()
+        stat.followers_ids = user.fetch_followers_ids(all=True)
+        stat.update()
+        stat.save()
 
-        while True:
-            ids = user.fetch_followers_ids(all=True)
-            log.debug('Call returned %s ids for user "%s" with offset %s, now member_ids %s' % (len(ids), user.screen_name, offset, len(stat.followers_ids)))
-
-            if len(ids) == 0:
-                break
-
-            # add new ids to user stat members
-            stat.followers_ids += ids
-            stat.offset = offset
-            stat.save()
-            offset += 1000
-
-        # save stat with time and other fields
-        stat.save_final()
-        signals.group_migration_updated.send(sender=RelationsHistory, instance=stat)
+#        signals.group_migration_updated.send(sender=RelationsHistory, instance=stat)
 
 #     def update_group_users_m2m(self, stat, offset=0):
 #         '''
@@ -133,6 +124,23 @@ class RelationsHistory(models.Model):
     class QuerySet(QuerySet, RelationsHistoryQueryset):
         pass
 
+#     class MethodDelta(object):
+#         def __init__(self, client, method_name):
+#             self.client = client
+#             self.method_name = method_name
+#
+#         def __getattr__(self, key):
+#             return RelationsHistory.MethodDelta(self.client, '.'.join((self.method_name, key)))
+#
+#         def __call__(self, prev=None):
+#             if not prev:
+#                 prev = self.prev
+#             if prev:
+#                 delta = RelationsHistoryDelta.objects.get_or_create(history_from=prev, history_to=self)[0]
+#                 return getattr(delta, self.method_name)
+#             else:
+#                 raise NoDeltaForFirstHistory("This history doesn't have previous history")
+
     user = models.ForeignKey(User, verbose_name=u'User', related_name='relations_history')
     time = models.DateTimeField(u'Datetime', null=True)
 
@@ -152,19 +160,46 @@ class RelationsHistory(models.Model):
         '''
         self.followers_ids = []
 
+    _next = None
+    _prev = None
+
     @property
     def next(self):
         try:
-            return self.user.relations_history.visible.filter(time__gt=self.time).order_by('time')[0]
-        except IndexError:
-            return None
+            assert self._next
+        except AssertionError:
+            try:
+                self._next = self.user.relations_history.visible.filter(time__gt=self.time).order_by('time')[0]
+            except IndexError:
+                return None
+        return self._next
 
     @property
     def prev(self):
         try:
-            return self.user.relations_history.visible.filter(time__lt=self.time).order_by('-time')[0]
-        except IndexError:
-            return None
+            assert self._prev
+        except AssertionError:
+            try:
+                self._prev = self.user.relations_history.visible.filter(time__lt=self.time).order_by('-time')[0]
+            except IndexError:
+                return None
+        return self._prev
+
+    def get_delta(self, name, prev=None):
+        if name in [field.name for field in RelationsHistoryDelta._meta.fields if 'followers' in field.name]:
+            if not prev:
+                prev = self.prev
+            if prev:
+                delta = RelationsHistoryDelta.objects.get_or_create(history_from=prev, history_to=self)[0]
+                return getattr(delta, name)
+            else:
+                raise NoDeltaForFirstHistory("This history doesn't have previous history")
+        else:
+            raise AttributeError("type object '%s' has no attribute '%s'" % (self.__class__, name))
+
+    def __getattr__(self, name):
+        return self.get_delta(name)
+#        return RelationsHistory.MethodDelta(self, name)
 
     def delete(self, *args, **kwargs):
         '''
@@ -196,19 +231,6 @@ class RelationsHistory(models.Model):
         if update_next:
             self.update_next()
 
-    def save_final(self):
-        self.time = datetime.now()
-        self.offset = 0
-        self.clean_members()
-        self.update()
-        self.save()
-
-    def clean_members(self):
-        '''
-        Remove double and empty values
-        '''
-        self.followers_ids = list(set(self.followers_ids))
-
     def update(self):
         self.update_migration()
         self.update_counters()
@@ -223,5 +245,28 @@ class RelationsHistory(models.Model):
     def update_counters(self):
         for field_name in ['followers']:
             setattr(self, field_name + '_count', len(getattr(self, field_name + '_ids')))
+
+class RelationsHistoryDelta(models.Model):
+    class Meta:
+        unique_together = ('history_from','history_to')
+
+    history_from = models.ForeignKey(RelationsHistory, related_name='deltas_from')
+    history_to = models.ForeignKey(RelationsHistory, related_name='deltas_to')
+
+    followers_left_ids = fields.PickledObjectField(default=[])
+    followers_entered_ids = fields.PickledObjectField(default=[])
+
+    followers_left_count = models.PositiveIntegerField(default=0)
+    followers_entered_count = models.PositiveIntegerField(default=0)
+
+    def save(self, *args, **kwargs):
+
+        self.followers_left_ids = list(set(self.history_from.followers_ids).difference(set(self.history_to.followers_ids)))
+        self.followers_entered_ids = list(set(self.history_to.followers_ids).difference(set(self.history_from.followers_ids)))
+
+        self.followers_left_count = len(self.followers_left_ids)
+        self.followers_entered_count = len(self.followers_entered_ids)
+
+        super(RelationsHistoryDelta, self).save(*args, **kwargs)
 
 import signals
